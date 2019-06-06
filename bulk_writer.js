@@ -1,5 +1,3 @@
-const fs = require('fs');
-const path = require('path');
 const Promise = require('promise');
 const debug = require('debug')('winston:elasticsearch');
 const retry = require('retry');
@@ -19,6 +17,8 @@ const BulkWriter = function BulkWriter(client, options) {
 
 BulkWriter.prototype.start = function start() {
   this.checkEsConnection();
+  this.running = true;
+  this.tick();
   debug('started');
 };
 
@@ -52,6 +52,7 @@ BulkWriter.prototype.tick = function tick() {
 
 BulkWriter.prototype.flush = function flush() {
   // write bulk to elasticsearch
+  const thiz = this;
   if (this.bulk.length === 0) {
     debug('nothing to flush');
     return new Promise((resolve) => {
@@ -60,33 +61,9 @@ BulkWriter.prototype.flush = function flush() {
   }
   const bulk = this.bulk.concat();
   this.bulk = [];
-  const body = [];
-  bulk.forEach(({ index, type, doc }) => {
-    body.push({ index: { _index: index, _type: type, pipeline: this.pipeline } }, doc);
-  });
-  debug('bulk writer is going to write', body);
-  return this.write(body);
-};
-
-BulkWriter.prototype.append = function append(index, type, doc) {
-  if (this.options.buffering === true) {
-    if (typeof this.options.bufferLimit === 'number' && this.bulk.length >= this.options.bufferLimit) {
-      debug('message discarded because buffer limit exceeded');
-      // @todo: i guess we can use callback to notify caller
-      return;
-    }
-    this.bulk.push({
-      index, type, doc
-    });
-  } else {
-    this.write([{ index: { _index: index, _type: type, pipeline: this.pipeline } }, doc]);
-  }
-};
-
-BulkWriter.prototype.write = function write(body) {
-  const thiz = this;
+  debug('going to write', bulk);
   return this.client.bulk({
-    body,
+    body: bulk,
     waitForActiveShards: this.waitForActiveShards,
     timeout: this.interval + 'ms',
     type: this.type
@@ -95,24 +72,28 @@ BulkWriter.prototype.write = function write(body) {
       res.items.forEach((item) => {
         if (item.index && item.index.error) {
           // eslint-disable-next-line no-console
-          console.error('Elasticsearch index error', item.index);
+          console.error('Elasticsearch index error', item.index.error);
         }
       });
     }
   }).catch((e) => { // prevent [DEP0018] DeprecationWarning
     // rollback this.bulk array
-    const lenSum = thiz.bulk.length + body.length;
-    if (thiz.options.bufferLimit && (lenSum >= thiz.options.bufferLimit)) {
-      thiz.bulk = body.concat(thiz.bulk.slice(0, thiz.options.bufferLimit - body.length));
-    } else {
-      thiz.bulk = body.concat(thiz.bulk);
-    }
+    thiz.bulk = bulk.concat(thiz.bulk);
     // eslint-disable-next-line no-console
     console.error(e);
-    debug('error occurred', e);
+    debug('error occrrued', e);
     this.stop();
     this.checkEsConnection();
   });
+};
+
+BulkWriter.prototype.append = function append(index, type, doc) {
+  this.bulk.push({
+    index: {
+      _index: index, _type: type, pipeline: this.pipeline
+    }
+  });
+  this.bulk.push(doc);
 };
 
 BulkWriter.prototype.checkEsConnection = function checkEsConnection() {
@@ -133,17 +114,10 @@ BulkWriter.prototype.checkEsConnection = function checkEsConnection() {
       thiz.client.ping().then(
         (res) => {
           thiz.esConnection = true;
-          // Ensure mapping template is existing if desired
-          if (thiz.options.ensureMappingTemplate) {
-            thiz.ensureMappingTemplate(fulfill, reject);
-          } else {
-            fulfill(true);
-          }
-          if (thiz.options.buffering === true) {
-            debug('starting bulk writer');
-            thiz.running = true;
-            thiz.tick();
-          }
+          fulfill(true);
+          debug('starting bulk writer');
+          thiz.running = true;
+          thiz.tick();
         },
         (err) => {
           debug('checking for connection');
@@ -156,41 +130,6 @@ BulkWriter.prototype.checkEsConnection = function checkEsConnection() {
       );
     });
   });
-};
-
-BulkWriter.prototype.ensureMappingTemplate = function ensureMappingTemplate(fulfill, reject) {
-  const thiz = this;
-  // eslint-disable-next-line prefer-destructuring
-  let mappingTemplate = thiz.options.mappingTemplate;
-  if (mappingTemplate === null || typeof mappingTemplate === 'undefined') {
-    const rawdata = fs.readFileSync(path.join(__dirname, 'index-template-mapping.json'));
-    mappingTemplate = JSON.parse(rawdata);
-  }
-  const tmplCheckMessage = {
-    name: 'template_' + (typeof thiz.options.indexPrefix === 'function' ? thiz.options.indexPrefix() : thiz.options.indexPrefix)
-  };
-  thiz.client.indices.getTemplate(tmplCheckMessage).then(
-    (res) => {
-      fulfill(res);
-    },
-    (res) => {
-      if (res.status && res.status === 404) {
-        const tmplMessage = {
-          name: 'template_' + (typeof thiz.options.indexPrefix === 'function' ? thiz.options.indexPrefix() : thiz.options.indexPrefix),
-          create: true,
-          body: mappingTemplate
-        };
-        thiz.client.indices.putTemplate(tmplMessage).then(
-          (res1) => {
-            fulfill(res1);
-          },
-          (err1) => {
-            reject(err1);
-          }
-        );
-      }
-    }
-  );
 };
 
 module.exports = BulkWriter;
